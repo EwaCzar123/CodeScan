@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -7,28 +8,41 @@ using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Microsoft.Build.Locator;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.MSBuild;
 using Microsoft.CodeAnalysis.Text;
-using Microsoft.CodeAnalysis.CSharp;
+using ClosedXML.Excel; // dotnet add package ClosedXML
 
 // -----------------------------------------------------------------------------
-// Underwriting External Usage Scanner — v2
-// - Filters "underwriting" by *solution folder membership* (via a list of project names),
-// - Produces EXACT columns: ReferencedProject, File, Line, Method, CodeLine
-// - Ignores matches using regex patterns against: referenced project name, assembly, namespace,
-//   symbol FQN, and definition file path.
-// Usage:
-//   dotnet run -- --solution ./all.sln \
-//       --underwriting-projects ./underwriting-projects.txt \
-//       --ignore-file ./exceptions.txt \
-//       --output ./underwriting-usages.csv \
-//       --format csv
-// where underwriting-projects.txt contains one project name per line (case-insensitive).
+// Underwriting Usage Scanner — v4
+// - Accepts a list of project NAMES (one per line) representing the "Underwriting" solution folder.
+// - Reports only usages from those projects to symbols defined in other projects in the solution.
+// - Columns: ReferencedProject, File, Line, Method, CodeLine
+// - Output formats: xlsx (multi-sheet, one sheet per UsingProject), csv (single sheet), md.
+// - Exceptions: regex patterns matched against Referenced project name, assembly name, namespace,
+//   symbol FQN, or definition path.
+//
+// Quick start (from repo root):
+//   1) Create underwriting-projects.txt with the 17 project names (exact solution names).
+//   2) (Optional) Create exceptions.txt with regex lines to ignore.
+//   3) Ensure packages installed in this scanner project:
+//        dotnet add package Microsoft.CodeAnalysis.MSBuild
+//        dotnet add package Microsoft.Build.Locator
+//        dotnet add package Microsoft.CodeAnalysis.CSharp.Workspaces
+//        dotnet add package ClosedXML
+//   4) Run:
+//        dotnet run --project tools/UnderwritingUsageScanner -- \
+//          --solution all.sln \
+//          --underwriting-projects underwriting-projects.txt \
+//          --ignore-file exceptions.txt \
+//          --output underwriting-usages.xlsx \
+//          --format xlsx
 // -----------------------------------------------------------------------------
 
 internal static class Program
 {
     private sealed record UsageHit(
+        string UsingProject,           // for grouping sheets (not a column in CSV/Excel)
         string ReferencedProject,
         string File,
         int Line,
@@ -38,54 +52,52 @@ internal static class Program
     private static async Task<int> Main(string[] args)
     {
         string solutionPath = GetArg(args, "--solution") ?? "all.sln";
-        string? underwritingProjectsFile = GetArg(args, "--underwriting-projects");
-        string? underwritingProjectsInline = GetArg(args, "--underwriting-projects-inline"); // optional: comma/semicolon-separated
-        string? ignoreFile = GetArg(args, "--ignore-file");
-        string output = GetArg(args, "--output") ?? "usages.csv";
-        string format = (GetArg(args, "--format") ?? "csv").ToLowerInvariant(); // csv | md
+        string underwritingProjectsFile = GetArg(args, "--underwriting-projects") ?? "underwriting-projects.txt";
+        string ignoreFile = GetArg(args, "--ignore-file");
+        string output = GetArg(args, "--output") ?? "underwriting-usages.xlsx";
+        string format = (GetArg(args, "--format") ?? InferFormatFromOutput(output)).ToLowerInvariant(); // xlsx|csv|md
 
+        solutionPath = Path.GetFullPath(solutionPath);
         if (!File.Exists(solutionPath))
         {
-            Console.Error.WriteLine($"Solution not found: {Path.GetFullPath(solutionPath)}");
+            Console.Error.WriteLine($"Solution not found: {solutionPath}");
             return 2;
         }
 
-        var underwritingNames = LoadUnderwritingNames(underwritingProjectsFile, underwritingProjectsInline);
+        var underwritingNames = LoadUnderwritingNames(underwritingProjectsFile);
         if (underwritingNames.Count == 0)
         {
-            Console.Error.WriteLine("No underwriting projects provided. Use --underwriting-projects <file> or --underwriting-projects-inline <A;B;C>.");
+            Console.Error.WriteLine("No underwriting projects provided. Put names in underwriting-projects.txt or pass --underwriting-projects.");
             return 2;
         }
 
         var ignoreMatchers = LoadIgnoreMatchers(ignoreFile);
 
-        // Roslyn/MSBuild bootstrap
-        MSBuildLocator.RegisterDefaults();
-        using var workspace = MSBuildWorkspace.Create();
+        // Robust MSBuild registration: prefer Visual Studio instance, else latest .NET SDK
+        RegisterMsBuild();
 
-        Console.WriteLine($"Loading solution: {Path.GetFullPath(solutionPath)}");
+        using var workspace = MSBuildWorkspace.Create();
+        workspace.WorkspaceFailed += (_, e) => Console.Error.WriteLine("[MSBuild] " + e.Diagnostic);
+
+        Console.WriteLine($"Loading solution: {solutionPath}");
         var solution = await workspace.OpenSolutionAsync(solutionPath);
 
         var allProjects = solution.Projects.Where(p => !string.IsNullOrEmpty(p.FilePath)).ToList();
-
-        var underwritingProjects = allProjects
-            .Where(p => underwritingNames.Contains(p.Name))
-            .ToList();
-
+        var underwritingProjects = allProjects.Where(p => underwritingNames.Contains(p.Name)).ToList();
         if (underwritingProjects.Count == 0)
         {
-            Console.Error.WriteLine("None of the provided underwriting project names were found in the solution.");
-            Console.Error.WriteLine("Projects in solution:\n  - " + string.Join("\n  - ", allProjects.Select(p => p.Name).OrderBy(s => s)));
+            Console.Error.WriteLine("Underwriting project names did not match any projects in the solution.");
+            Console.Error.WriteLine("Projects available:\n  - " + string.Join("\n  - ", allProjects.Select(p => p.Name).OrderBy(s => s)));
             return 2;
         }
 
-        // AssemblyName -> Project map for resolving definitions
+        // Map assembly name -> project (for resolving definition project)
         var projByAssembly = allProjects
             .Where(p => !string.IsNullOrEmpty(p.AssemblyName))
             .GroupBy(p => p.AssemblyName!, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
 
-        var hits = new List<UsageHit>(capacity: 1024);
+        var hits = new List<UsageHit>(capacity: 4096);
 
         foreach (var usingProject in underwritingProjects)
         {
@@ -102,7 +114,6 @@ internal static class Program
                 var root = await tree.GetRootAsync();
                 var text = await doc.GetTextAsync();
 
-                // Scan common nodes representing symbol usages
                 var nodes = root.DescendantNodes().Where(n =>
                     n is Microsoft.CodeAnalysis.CSharp.Syntax.IdentifierNameSyntax ||
                     n is Microsoft.CodeAnalysis.CSharp.Syntax.QualifiedNameSyntax ||
@@ -112,36 +123,25 @@ internal static class Program
 
                 foreach (var node in nodes)
                 {
-                    SymbolInfo info = model.GetSymbolInfo(node);
+                    var info = model.GetSymbolInfo(node);
                     var symbol = info.Symbol ?? info.CandidateSymbols.FirstOrDefault();
                     if (symbol is null) continue;
-
                     symbol = symbol.OriginalDefinition;
 
                     var asm = symbol.ContainingAssembly?.Name ?? string.Empty;
                     var defPath = GetDefinitionPath(symbol);
+                    if (string.IsNullOrEmpty(defPath)) continue; // metadata-only (NuGet/BCL)
 
-                    // Only consider symbols that have source inside this solution (exclude NuGet/BCL by default)
-                    if (string.IsNullOrEmpty(defPath)) continue;
+                    if (!projByAssembly.TryGetValue(asm, out var defProj)) continue; // unknown project
+                    if (underwritingNames.Contains(defProj.Name)) continue; // stays inside underwriting
 
-                    // Resolve referenced project by assembly name (best effort)
-                    projByAssembly.TryGetValue(asm, out var defProj);
-                    var defProjectName = defProj?.Name ?? string.Empty;
-                    var defNamespace = symbol.ContainingNamespace?.ToDisplayString() ?? string.Empty;
-
-                    // We want ONLY references that point to projects OUTSIDE the underwriting set
-                    if (string.IsNullOrEmpty(defProjectName)) continue; // skip if we couldn't map
-                    if (underwritingNames.Contains(defProjectName)) continue; // it's inside underwriting, ignore
-
-                    // Apply ignore rules (project, assembly, namespace, symbol FQN, path)
-                    if (IsIgnored(ignoreMatchers, defProjectName) ||
+                    var ns = symbol.ContainingNamespace?.ToDisplayString() ?? string.Empty;
+                    if (IsIgnored(ignoreMatchers, defProj.Name) ||
                         IsIgnored(ignoreMatchers, asm) ||
-                        IsIgnored(ignoreMatchers, defNamespace) ||
+                        IsIgnored(ignoreMatchers, ns) ||
                         IsIgnored(ignoreMatchers, GetDisplay(symbol)) ||
                         IsIgnored(ignoreMatchers, defPath))
-                    {
                         continue;
-                    }
 
                     var linePos = tree.GetLineSpan(node.Span).StartLinePosition;
                     int line = linePos.Line + 1;
@@ -149,7 +149,8 @@ internal static class Program
                     string method = GetEnclosingMember(model, node.SpanStart);
 
                     hits.Add(new UsageHit(
-                        ReferencedProject: defProjectName,
+                        UsingProject: usingProject.Name,
+                        ReferencedProject: defProj.Name,
                         File: doc.FilePath ?? string.Empty,
                         Line: line,
                         Method: method,
@@ -159,34 +160,104 @@ internal static class Program
             }
         }
 
-        // Sort: referenced project, then file, then line
+        // Sort nicely (sheet, then file/line)
         hits = hits
-            .OrderBy(h => h.ReferencedProject, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(h => h.UsingProject, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(h => h.ReferencedProject, StringComparer.OrdinalIgnoreCase)
             .ThenBy(h => h.File, StringComparer.OrdinalIgnoreCase)
             .ThenBy(h => h.Line)
             .ToList();
 
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output)) ?? ".");
-        await File.WriteAllTextAsync(output, format == "md" ? ToMarkdown(hits) : ToCsv(hits));
-        Console.WriteLine($"Wrote {hits.Count} hits to {output}");
+
+        switch (format)
+        {
+            case "xlsx":
+                WriteExcel(hits, output);
+                Console.WriteLine($"Wrote {hits.Count} rows to workbook: {output}");
+                break;
+            case "csv":
+                await File.WriteAllTextAsync(output, ToCsv(hits));
+                Console.WriteLine($"Wrote {hits.Count} rows to {output}");
+                break;
+            case "md":
+                await File.WriteAllTextAsync(output, ToMarkdown(hits));
+                Console.WriteLine($"Wrote {hits.Count} rows to {output}");
+                break;
+            default:
+                Console.Error.WriteLine($"Unknown format: {format}");
+                return 2;
+        }
+
         return 0;
     }
 
-    // -------------------------- helpers --------------------------
-
-    private static string GetArg(string[] args, string name)
+    // -------------------------- Excel output (multi-sheet) --------------------------
+    private static void WriteExcel(List<UsageHit> hits, string xlsxPath)
     {
-        for (int i = 0; i < args.Length; i++)
+        using var wb = new XLWorkbook();
+        foreach (var group in hits.GroupBy(h => h.UsingProject, StringComparer.OrdinalIgnoreCase))
         {
-            if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
-            { return (i + 1 < args.Length) ? args[i + 1] : string.Empty; }
-            if (args[i].StartsWith(name + "=", StringComparison.OrdinalIgnoreCase))
-            { return args[i].Substring(name.Length + 1); }
+            var ws = wb.Worksheets.Add(SanitizeSheetName(group.Key));
+
+            // headers (exactly the requested columns)
+            ws.Cell(1, 1).Value = "ReferencedProject";
+            ws.Cell(1, 2).Value = "File";
+            ws.Cell(1, 3).Value = "Line";
+            ws.Cell(1, 4).Value = "Method";
+            ws.Cell(1, 5).Value = "CodeLine";
+            ws.Range(1, 1, 1, 5).Style.Font.Bold = true;
+
+            int r = 2;
+            foreach (var h in group)
+            {
+                ws.Cell(r, 1).Value = h.ReferencedProject;
+                ws.Cell(r, 2).Value = Rel(h.File);
+                ws.Cell(r, 3).Value = h.Line;
+                ws.Cell(r, 4).Value = h.Method;
+                ws.Cell(r, 5).Value = h.CodeLine;
+                r++;
+            }
+
+            ws.Columns().AdjustToContents();
+            ws.SheetView.FreezeRows(1);
         }
-        return null!;
+        wb.SaveAs(xlsxPath);
     }
 
-    private static HashSet<string> LoadUnderwritingNames(string? file, string? inline)
+    private static string SanitizeSheetName(string raw)
+    {
+        var name = raw;
+        foreach (var c in new[] { '\\', '/', '*', '[', ']', ':', '?' })
+            name = name.Replace(c, ' ');
+        if (name.Length > 31) name = name.Substring(0, 31);
+        return string.IsNullOrWhiteSpace(name) ? "Sheet" : name;
+    }
+
+    // -------------------------- helpers --------------------------
+    private static void RegisterMsBuild()
+    {
+        var vs = MSBuildLocator.QueryVisualStudioInstances().OrderByDescending(i => i.Version).FirstOrDefault();
+        if (vs != null)
+        {
+            MSBuildLocator.RegisterInstance(vs);
+            return;
+        }
+        var dotnetRoot = Environment.GetEnvironmentVariable("DOTNET_ROOT");
+#if WINDOWS
+        dotnetRoot ??= @"C:\\Program Files\\dotnet";
+#else
+        dotnetRoot ??= Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotnet");
+#endif
+        var sdkDir = Path.Combine(dotnetRoot!, "sdk");
+        var latest = Directory.Exists(sdkDir)
+            ? Directory.GetDirectories(sdkDir).OrderByDescending(Path.GetFileName).FirstOrDefault()
+            : null;
+        if (latest is null) throw new Exception("No .NET SDK found. Install .NET SDK or VS Build Tools.");
+        MSBuildLocator.RegisterMSBuildPath(latest);
+    }
+
+    private static HashSet<string> LoadUnderwritingNames(string file)
     {
         var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (!string.IsNullOrWhiteSpace(file) && File.Exists(file))
@@ -196,14 +267,6 @@ internal static class Program
                 var line = raw.Trim();
                 if (line.Length == 0 || line.StartsWith("#")) continue;
                 set.Add(line);
-            }
-        }
-        if (!string.IsNullOrWhiteSpace(inline))
-        {
-            foreach (var part in inline.Split(new[] {',',';','\n'}, StringSplitOptions.RemoveEmptyEntries))
-            {
-                var name = part.Trim();
-                if (name.Length > 0) set.Add(name);
             }
         }
         return set;
