@@ -195,28 +195,31 @@ internal static class Program
             var line = raw.Trim();
             if (line.Length == 0 || line.StartsWith("#")) continue;
 
-            // Split on whitespace: "<proj> <namespace>" -> project-scoped rule
-            var parts = line.Split((char[]?)null, 2, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length == 2)
+            // 1) Quoted project name/path with spaces: "My Project" Contoso.Ns
+            var m = Regex.Match(line, "^\"(?<proj>[^\"]+)\"\s+(?<ns>.+)$");
+            if (m.Success)
             {
-                var projToken = parts[0].Trim();
-                var nsPrefix = parts[1].Trim();
-                var rule = new IgnoreRule();
-                if (LooksLikePath(projToken))
-                {
-                    rule.ProjectPathLiteral = NormalizePathForMatch(projToken);
-                }
-                else
-                {
-                    rule.ProjectNameLiteral = projToken;
-                }
-                rule.NamespacePrefix = nsPrefix; // CI prefix match later
-                rules.Add(rule);
+                var projToken = m.Groups["proj"].Value.Trim();
+                var nsPrefix = m.Groups["ns"].Value.Trim();
+                rules.Add(BuildProjectScopedRule(projToken, nsPrefix));
                 continue;
             }
 
-            // Single token: could be project name, project path, folder path, or regex
-            var token = parts[0];
+            // 2) Unquoted: split on first whitespace -> <projToken> <namespaceOrNothing>
+            int ws = line.IndexOfAny(new[] { ' ', '	' });
+            if (ws > 0)
+            {
+                var projToken = line.Substring(0, ws).Trim();
+                var nsPrefix = line.Substring(ws + 1).Trim();
+                if (nsPrefix.Length > 0)
+                {
+                    rules.Add(BuildProjectScopedRule(projToken, nsPrefix));
+                    continue;
+                }
+            }
+
+            // 3) Single token line: could be project name, project/folder path, or regex
+            var token = line;
             if (LooksLikePath(token))
             {
                 rules.Add(new IgnoreRule { ProjectPathLiteral = NormalizePathForMatch(token) });
