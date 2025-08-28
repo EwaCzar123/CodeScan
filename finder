@@ -1,0 +1,308 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using Microsoft.Build.Locator;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.MSBuild;
+using Microsoft.CodeAnalysis.Text;
+using Microsoft.CodeAnalysis.CSharp;
+
+// -----------------------------------------------------------------------------
+// Underwriting External Usage Scanner — v2
+// - Filters "underwriting" by *solution folder membership* (via a list of project names),
+// - Produces EXACT columns: ReferencedProject, File, Line, Method, CodeLine
+// - Ignores matches using regex patterns against: referenced project name, assembly, namespace,
+//   symbol FQN, and definition file path.
+// Usage:
+//   dotnet run -- --solution ./all.sln \
+//       --underwriting-projects ./underwriting-projects.txt \
+//       --ignore-file ./exceptions.txt \
+//       --output ./underwriting-usages.csv \
+//       --format csv
+// where underwriting-projects.txt contains one project name per line (case-insensitive).
+// -----------------------------------------------------------------------------
+
+internal static class Program
+{
+    private sealed record UsageHit(
+        string ReferencedProject,
+        string File,
+        int Line,
+        string Method,
+        string CodeLine);
+
+    private static async Task<int> Main(string[] args)
+    {
+        string solutionPath = GetArg(args, "--solution") ?? "all.sln";
+        string? underwritingProjectsFile = GetArg(args, "--underwriting-projects");
+        string? underwritingProjectsInline = GetArg(args, "--underwriting-projects-inline"); // optional: comma/semicolon-separated
+        string? ignoreFile = GetArg(args, "--ignore-file");
+        string output = GetArg(args, "--output") ?? "usages.csv";
+        string format = (GetArg(args, "--format") ?? "csv").ToLowerInvariant(); // csv | md
+
+        if (!File.Exists(solutionPath))
+        {
+            Console.Error.WriteLine($"Solution not found: {Path.GetFullPath(solutionPath)}");
+            return 2;
+        }
+
+        var underwritingNames = LoadUnderwritingNames(underwritingProjectsFile, underwritingProjectsInline);
+        if (underwritingNames.Count == 0)
+        {
+            Console.Error.WriteLine("No underwriting projects provided. Use --underwriting-projects <file> or --underwriting-projects-inline <A;B;C>.");
+            return 2;
+        }
+
+        var ignoreMatchers = LoadIgnoreMatchers(ignoreFile);
+
+        // Roslyn/MSBuild bootstrap
+        MSBuildLocator.RegisterDefaults();
+        using var workspace = MSBuildWorkspace.Create();
+
+        Console.WriteLine($"Loading solution: {Path.GetFullPath(solutionPath)}");
+        var solution = await workspace.OpenSolutionAsync(solutionPath);
+
+        var allProjects = solution.Projects.Where(p => !string.IsNullOrEmpty(p.FilePath)).ToList();
+
+        var underwritingProjects = allProjects
+            .Where(p => underwritingNames.Contains(p.Name))
+            .ToList();
+
+        if (underwritingProjects.Count == 0)
+        {
+            Console.Error.WriteLine("None of the provided underwriting project names were found in the solution.");
+            Console.Error.WriteLine("Projects in solution:\n  - " + string.Join("\n  - ", allProjects.Select(p => p.Name).OrderBy(s => s)));
+            return 2;
+        }
+
+        // AssemblyName -> Project map for resolving definitions
+        var projByAssembly = allProjects
+            .Where(p => !string.IsNullOrEmpty(p.AssemblyName))
+            .GroupBy(p => p.AssemblyName!, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+
+        var hits = new List<UsageHit>(capacity: 1024);
+
+        foreach (var usingProject in underwritingProjects)
+        {
+            var compilation = await usingProject.GetCompilationAsync();
+            if (compilation is null) continue;
+
+            foreach (var doc in usingProject.Documents.Where(d => d.SourceCodeKind == SourceCodeKind.Regular && d.SupportsSyntaxTree))
+            {
+                var tree = await doc.GetSyntaxTreeAsync();
+                if (tree is null) continue;
+                var model = await doc.GetSemanticModelAsync();
+                if (model is null) continue;
+
+                var root = await tree.GetRootAsync();
+                var text = await doc.GetTextAsync();
+
+                // Scan common nodes representing symbol usages
+                var nodes = root.DescendantNodes().Where(n =>
+                    n is Microsoft.CodeAnalysis.CSharp.Syntax.IdentifierNameSyntax ||
+                    n is Microsoft.CodeAnalysis.CSharp.Syntax.QualifiedNameSyntax ||
+                    n is Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax ||
+                    n is Microsoft.CodeAnalysis.CSharp.Syntax.ObjectCreationExpressionSyntax ||
+                    n is Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax);
+
+                foreach (var node in nodes)
+                {
+                    SymbolInfo info = model.GetSymbolInfo(node);
+                    var symbol = info.Symbol ?? info.CandidateSymbols.FirstOrDefault();
+                    if (symbol is null) continue;
+
+                    symbol = symbol.OriginalDefinition;
+
+                    var asm = symbol.ContainingAssembly?.Name ?? string.Empty;
+                    var defPath = GetDefinitionPath(symbol);
+
+                    // Only consider symbols that have source inside this solution (exclude NuGet/BCL by default)
+                    if (string.IsNullOrEmpty(defPath)) continue;
+
+                    // Resolve referenced project by assembly name (best effort)
+                    projByAssembly.TryGetValue(asm, out var defProj);
+                    var defProjectName = defProj?.Name ?? string.Empty;
+                    var defNamespace = symbol.ContainingNamespace?.ToDisplayString() ?? string.Empty;
+
+                    // We want ONLY references that point to projects OUTSIDE the underwriting set
+                    if (string.IsNullOrEmpty(defProjectName)) continue; // skip if we couldn't map
+                    if (underwritingNames.Contains(defProjectName)) continue; // it's inside underwriting, ignore
+
+                    // Apply ignore rules (project, assembly, namespace, symbol FQN, path)
+                    if (IsIgnored(ignoreMatchers, defProjectName) ||
+                        IsIgnored(ignoreMatchers, asm) ||
+                        IsIgnored(ignoreMatchers, defNamespace) ||
+                        IsIgnored(ignoreMatchers, GetDisplay(symbol)) ||
+                        IsIgnored(ignoreMatchers, defPath))
+                    {
+                        continue;
+                    }
+
+                    var linePos = tree.GetLineSpan(node.Span).StartLinePosition;
+                    int line = linePos.Line + 1;
+                    string codeLine = SafeGetLine(text, linePos.Line).Trim();
+                    string method = GetEnclosingMember(model, node.SpanStart);
+
+                    hits.Add(new UsageHit(
+                        ReferencedProject: defProjectName,
+                        File: doc.FilePath ?? string.Empty,
+                        Line: line,
+                        Method: method,
+                        CodeLine: codeLine
+                    ));
+                }
+            }
+        }
+
+        // Sort: referenced project, then file, then line
+        hits = hits
+            .OrderBy(h => h.ReferencedProject, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(h => h.File, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(h => h.Line)
+            .ToList();
+
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output)) ?? ".");
+        await File.WriteAllTextAsync(output, format == "md" ? ToMarkdown(hits) : ToCsv(hits));
+        Console.WriteLine($"Wrote {hits.Count} hits to {output}");
+        return 0;
+    }
+
+    // -------------------------- helpers --------------------------
+
+    private static string GetArg(string[] args, string name)
+    {
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
+            { return (i + 1 < args.Length) ? args[i + 1] : string.Empty; }
+            if (args[i].StartsWith(name + "=", StringComparison.OrdinalIgnoreCase))
+            { return args[i].Substring(name.Length + 1); }
+        }
+        return null!;
+    }
+
+    private static HashSet<string> LoadUnderwritingNames(string? file, string? inline)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(file) && File.Exists(file))
+        {
+            foreach (var raw in File.ReadAllLines(file))
+            {
+                var line = raw.Trim();
+                if (line.Length == 0 || line.StartsWith("#")) continue;
+                set.Add(line);
+            }
+        }
+        if (!string.IsNullOrWhiteSpace(inline))
+        {
+            foreach (var part in inline.Split(new[] {',',';','\n'}, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var name = part.Trim();
+                if (name.Length > 0) set.Add(name);
+            }
+        }
+        return set;
+    }
+
+    private static List<Regex> LoadIgnoreMatchers(string? ignoreFile)
+    {
+        var list = new List<Regex>();
+        if (string.IsNullOrWhiteSpace(ignoreFile) || !File.Exists(ignoreFile)) return list;
+        foreach (var raw in File.ReadAllLines(ignoreFile))
+        {
+            var line = raw.Trim();
+            if (line.Length == 0 || line.StartsWith("#")) continue;
+            list.Add(new Regex(line, RegexOptions.IgnoreCase | RegexOptions.Compiled));
+        }
+        return list;
+    }
+
+    private static bool IsIgnored(List<Regex> matchers, string candidate)
+        => !string.IsNullOrEmpty(candidate) && matchers.Any(rx => rx.IsMatch(candidate));
+
+    private static string GetDefinitionPath(ISymbol symbol)
+    {
+        var loc = symbol.Locations.FirstOrDefault(l => l.IsInSource);
+        return loc != null ? (loc.SourceTree?.FilePath ?? string.Empty) : string.Empty;
+    }
+
+    private static string GetDisplay(ISymbol s)
+    {
+        var format = new SymbolDisplayFormat(
+            globalNamespaceStyle: SymbolDisplayGlobalNamespaceStyle.Omitted,
+            typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameAndContainingTypesAndNamespaces,
+            genericsOptions: SymbolDisplayGenericsOptions.IncludeTypeParameters,
+            memberOptions: SymbolDisplayMemberOptions.IncludeParameters | SymbolDisplayMemberOptions.IncludeContainingType,
+            parameterOptions: SymbolDisplayParameterOptions.IncludeType | SymbolDisplayParameterOptions.IncludeName,
+            miscellaneousOptions: SymbolDisplayMiscellaneousOptions.ExpandNullable);
+        return s.ToDisplayString(format);
+    }
+
+    private static string SafeGetLine(SourceText text, int zeroBasedLine)
+        => (zeroBasedLine < 0 || zeroBasedLine >= text.Lines.Count) ? string.Empty : text.Lines[zeroBasedLine].ToString();
+
+    private static string ToCsv(IEnumerable<UsageHit> hits)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("ReferencedProject,File,Line,Method,CodeLine");
+        foreach (var h in hits)
+        {
+            sb.AppendLine(string.Join(',', new[]
+            {
+                Csv(h.ReferencedProject), Csv(Rel(h.File)), h.Line.ToString(), Csv(h.Method), Csv(h.CodeLine)
+            }));
+        }
+        return sb.ToString();
+    }
+
+    private static string Csv(string s)
+    {
+        if (s is null) return string.Empty;
+        if (s.Contains('"') || s.Contains(',') || s.Contains('\n'))
+            return '"' + s.Replace("\"", "\"\"") + '"';
+        return s;
+    }
+
+    private static string ToMarkdown(IEnumerable<UsageHit> hits)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("| Referenced Project | File | Line | Method | Code Line |");
+        sb.AppendLine("|---|---|---:|---|---|");
+        foreach (var h in hits)
+        {
+            sb.AppendLine($"| {Esc(h.ReferencedProject)} | {Esc(Rel(h.File))} | {h.Line} | {Esc(h.Method)} | {Esc(Trunc(h.CodeLine, 120))} |");
+        }
+        return sb.ToString();
+    }
+
+    private static string Rel(string path)
+    {
+        try { return Path.GetRelativePath(Directory.GetCurrentDirectory(), path); } catch { return path; }
+    }
+
+    private static string Trunc(string s, int max)
+        => string.IsNullOrEmpty(s) || s.Length <= max ? s : s.Substring(0, max - 1) + "…";
+
+    private static string Esc(string s) => s.Replace("|", "\\|");
+
+    private static string GetEnclosingMember(SemanticModel model, int position)
+    {
+        var symbol = model.GetEnclosingSymbol(position);
+        if (symbol == null) return string.Empty;
+        ISymbol cur = symbol;
+        while (cur != null && cur is not IMethodSymbol && cur is not IPropertySymbol && cur is not IEventSymbol && cur is not IFieldSymbol)
+            cur = cur.ContainingSymbol;
+        if (cur == null) cur = symbol.ContainingType ?? symbol;
+
+        var fmt = new SymbolDisplayFormat(
+            typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameAndContainingTypesAndNamespaces,
+            memberOptions: SymbolDisplayMemberOptions.IncludeParameters | SymbolDisplayMemberOptions.IncludeContainingType,
+            parameterOptions: SymbolDisplayParameterOptions.IncludeType | SymbolDisplayParameterOptions.IncludeName);
+        return cur.ToDisplayString(fmt);
+    }
+}
