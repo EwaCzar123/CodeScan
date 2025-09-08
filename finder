@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Microsoft.Build.Locator;
@@ -14,16 +13,7 @@ using Microsoft.CodeAnalysis.Text;
 using ClosedXML.Excel; // dotnet add package ClosedXML
 
 // -----------------------------------------------------------------------------
-// Underwriting Usage Scanner — v5
-// Changes in this version:
-// - Enhanced ignore rules file (passed via --ignore-file) supports:
-//    1) Plain project NAME              -> ignore everything from that project
-//    2) Plain project PATH (.csproj)    -> ignore everything from that project (path literal or folder)
-//    3) "<proj> <namespacePrefix>"     -> for the given project, ignore ONLY that namespace (prefix match)
-//       - <proj> can be project name OR path to the .csproj (absolute or relative)
-//       - <namespacePrefix> like Contoso.Contracts or Contoso.Contracts.Sub
-//    4) Regex lines                     -> still supported; apply to proj name/path, assembly, namespace, symbol FQN, or definition file path
-// - Folder-style paths end with a separator or no .csproj; those ignore any project whose csproj path starts with that folder.
+// Underwriting Usage Scanner — Simplified (XLSX only)
 // -----------------------------------------------------------------------------
 
 internal static class Program
@@ -36,13 +26,12 @@ internal static class Program
         string Method,
         string CodeLine);
 
-    // ---- Ignore rule model ----
     private sealed class IgnoreRule
     {
-        public string? ProjectNameLiteral { get; init; }        // case-insensitive exact match
-        public string? ProjectPathLiteral { get; init; }        // normalized full path (project .csproj) or folder
-        public string? NamespacePrefix { get; init; }           // case-insensitive prefix
-        public Regex? Regex { get; init; }                      // fallback regex
+        public string? ProjectNameLiteral { get; init; }
+        public string? ProjectPathLiteral { get; init; }
+        public string? NamespacePrefix { get; init; }
+        public Regex? Regex { get; init; }
     }
 
     private static async Task<int> Main(string[] args)
@@ -51,7 +40,6 @@ internal static class Program
         string underwritingProjectsFile = GetArg(args, "--underwriting-projects") ?? "underwriting-projects.txt";
         string ignoreFile = GetArg(args, "--ignore-file");
         string output = GetArg(args, "--output") ?? "underwriting-usages.xlsx";
-        string format = (GetArg(args, "--format") ?? InferFormatFromOutput(output)).ToLowerInvariant(); // xlsx|csv|md
 
         solutionPath = Path.GetFullPath(solutionPath);
         if (!File.Exists(solutionPath))
@@ -63,7 +51,7 @@ internal static class Program
         var underwritingNames = LoadUnderwritingNames(underwritingProjectsFile);
         if (underwritingNames.Count == 0)
         {
-            Console.Error.WriteLine("No underwriting projects provided. Put names in underwriting-projects.txt or pass --underwriting-projects.");
+            Console.Error.WriteLine("No underwriting projects provided.");
             return 2;
         }
 
@@ -81,17 +69,15 @@ internal static class Program
         if (underwritingProjects.Count == 0)
         {
             Console.Error.WriteLine("Underwriting project names did not match any projects in the solution.");
-            Console.Error.WriteLine("Projects available:\n  - " + string.Join("\n  - ", allProjects.Select(p => p.Name).OrderBy(s => s)));
             return 2;
         }
 
-        // AssemblyName -> Project map
         var projByAssembly = allProjects
             .Where(p => !string.IsNullOrEmpty(p.AssemblyName))
             .GroupBy(p => p.AssemblyName!, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
 
-        var hits = new List<UsageHit>(capacity: 4096);
+        var hits = new List<UsageHit>();
 
         foreach (var usingProject in underwritingProjects)
         {
@@ -124,10 +110,10 @@ internal static class Program
 
                     var asm = symbol.ContainingAssembly?.Name ?? string.Empty;
                     var defPath = GetDefinitionPath(symbol);
-                    if (string.IsNullOrEmpty(defPath)) continue; // metadata-only
+                    if (string.IsNullOrEmpty(defPath)) continue;
 
-                    if (!projByAssembly.TryGetValue(asm, out var defProj)) continue; // unknown
-                    if (underwritingNames.Contains(defProj.Name)) continue; // internal reference
+                    if (!projByAssembly.TryGetValue(asm, out var defProj)) continue;
+                    if (underwritingNames.Contains(defProj.Name)) continue;
 
                     var ns = symbol.ContainingNamespace?.ToDisplayString() ?? string.Empty;
                     var defProjPath = defProj.FilePath ?? string.Empty;
@@ -152,7 +138,6 @@ internal static class Program
             }
         }
 
-        // Sort
         hits = hits
             .OrderBy(h => h.UsingProject, StringComparer.OrdinalIgnoreCase)
             .ThenBy(h => h.ReferencedProject, StringComparer.OrdinalIgnoreCase)
@@ -161,26 +146,8 @@ internal static class Program
             .ToList();
 
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output)) ?? ".");
-
-        switch (format)
-        {
-            case "xlsx":
-                WriteExcel(hits, output);
-                Console.WriteLine($"Wrote {hits.Count} rows to workbook: {output}");
-                break;
-            case "csv":
-                File.WriteAllText(output, ToCsv(hits));
-                Console.WriteLine($"Wrote {hits.Count} rows to {output}");
-                break;
-            case "md":
-                File.WriteAllText(output, ToMarkdown(hits));
-                Console.WriteLine($"Wrote {hits.Count} rows to {output}");
-                break;
-            default:
-                Console.Error.WriteLine($"Unknown format: {format}");
-                return 2;
-        }
-
+        WriteExcel(hits, output);
+        Console.WriteLine($"Wrote {hits.Count} rows to workbook: {output}");
         return 0;
     }
 
@@ -195,8 +162,7 @@ internal static class Program
             var line = raw.Trim();
             if (line.Length == 0 || line.StartsWith("#")) continue;
 
-            // 1) Quoted project name/path with spaces: "My Project" Contoso.Ns
-            var m = Regex.Match(line, "^\"(?<proj>[^\"]+)\"\s+(?<ns>.+)$");
+            var m = Regex.Match(line, @"^""(?<proj>[^""]+)""\s+(?<ns>.+)$");
             if (m.Success)
             {
                 var projToken = m.Groups["proj"].Value.Trim();
@@ -205,12 +171,11 @@ internal static class Program
                 continue;
             }
 
-            // 2) Unquoted: split on first whitespace -> <projToken> <namespaceOrNothing>
-            int ws = line.IndexOfAny(new[] { ' ', '	' });
+            int ws = line.IndexOfAny(new[] { ' ', '\t' });
             if (ws > 0)
             {
                 var projToken = line.Substring(0, ws).Trim();
-                var nsPrefix = line.Substring(ws + 1).Trim();
+                var nsPrefix = line[(ws + 1)..].Trim();
                 if (nsPrefix.Length > 0)
                 {
                     rules.Add(BuildProjectScopedRule(projToken, nsPrefix));
@@ -218,35 +183,23 @@ internal static class Program
                 }
             }
 
-            // 3) Single token line: could be project name, project/folder path, or regex
             var token = line;
             if (LooksLikePath(token))
-            {
                 rules.Add(new IgnoreRule { ProjectPathLiteral = NormalizePathForMatch(token) });
-            }
             else if (MaybeRegex(token))
-            {
                 rules.Add(new IgnoreRule { Regex = new Regex(token, RegexOptions.IgnoreCase | RegexOptions.Compiled) });
-            }
             else
-            {
                 rules.Add(new IgnoreRule { ProjectNameLiteral = token });
-            }
         }
         return rules;
     }
 
-    private static bool LooksLikePath(string token)
-    {
-        return token.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase) ||
-               token.Contains('/') || token.Contains('\\');
-    }
+    private static bool LooksLikePath(string token) =>
+        token.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase) ||
+        token.Contains('/') || token.Contains('\\');
 
-    private static bool MaybeRegex(string token)
-    {
-        // Heuristic: if it has regex-y chars, treat as regex
-        return token.Contains("^") || token.Contains("$") || token.Contains("(") || token.Contains("[") || token.Contains("|") || token.Contains("?") || token.Contains("+") || token.Contains("{");
-    }
+    private static bool MaybeRegex(string token) =>
+        token.IndexOfAny(new[] { '^', '$', '(', '[', '|', '?', '+', '{' }) >= 0;
 
     private static string NormalizePathForMatch(string p)
     {
@@ -280,41 +233,29 @@ internal static class Program
             else if (!string.IsNullOrEmpty(r.ProjectPathLiteral))
             {
                 var lit = NormalizePathForMatch(r.ProjectPathLiteral);
-                // exact file match or folder prefix match
                 projMatch = string.Equals(defProjectPath, lit, StringComparison.OrdinalIgnoreCase) ||
-                            (defProjectPath.StartsWith(lit + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase));
+                            defProjectPath.StartsWith(lit + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
             }
             else
             {
-                // No project constraint; treat as global (shouldn't happen here since regex handles that)
                 projMatch = true;
             }
 
             if (!projMatch) continue;
 
-            // If a namespace prefix is specified, require it
             if (!string.IsNullOrEmpty(r.NamespacePrefix))
             {
                 if (ns.StartsWith(r.NamespacePrefix, StringComparison.OrdinalIgnoreCase))
                     return true;
-                continue; // project matched but namespace didn't; don't ignore
+                continue;
             }
 
-            // Project matched and no namespace restriction => ignore
             return true;
         }
-
         return false;
     }
 
     // -------------------------- Excel output --------------------------
-    private sealed record Row(
-        string ReferencedProject,
-        string File,
-        int Line,
-        string Method,
-        string CodeLine);
-
     private static void WriteExcel(List<UsageHit> hits, string xlsxPath)
     {
         using var wb = new XLWorkbook();
@@ -358,11 +299,7 @@ internal static class Program
     private static void RegisterMsBuild()
     {
         var vs = MSBuildLocator.QueryVisualStudioInstances().OrderByDescending(i => i.Version).FirstOrDefault();
-        if (vs != null)
-        {
-            MSBuildLocator.RegisterInstance(vs);
-            return;
-        }
+        if (vs != null) { MSBuildLocator.RegisterInstance(vs); return; }
         var dotnetRoot = Environment.GetEnvironmentVariable("DOTNET_ROOT");
 #if WINDOWS
         dotnetRoot ??= @"C:\\Program Files\\dotnet";
@@ -373,7 +310,7 @@ internal static class Program
         var latest = Directory.Exists(sdkDir)
             ? Directory.GetDirectories(sdkDir).OrderByDescending(Path.GetFileName).FirstOrDefault()
             : null;
-        if (latest is null) throw new Exception("No .NET SDK found. Install .NET SDK or VS Build Tools.");
+        if (latest is null) throw new Exception("No .NET SDK found.");
         MSBuildLocator.RegisterMSBuildPath(latest);
     }
 
@@ -397,20 +334,11 @@ internal static class Program
         for (int i = 0; i < args.Length; i++)
         {
             if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
-            { return (i + 1 < args.Length) ? args[i + 1] : string.Empty; }
+                return (i + 1 < args.Length) ? args[i + 1] : string.Empty;
             if (args[i].StartsWith(name + "=", StringComparison.OrdinalIgnoreCase))
-            { return args[i].Substring(name.Length + 1); }
+                return args[i].Substring(name.Length + 1);
         }
         return null!;
-    }
-
-    private static string InferFormatFromOutput(string output)
-    {
-        var ext = Path.GetExtension(output).ToLowerInvariant();
-        return ext switch { 
-            ".xlsx" => "xlsx",
-            ".md" => "md",
-            _ => "csv" };
     }
 
     private static string GetDefinitionPath(ISymbol symbol)
@@ -434,49 +362,10 @@ internal static class Program
     private static string SafeGetLine(SourceText text, int zeroBasedLine)
         => (zeroBasedLine < 0 || zeroBasedLine >= text.Lines.Count) ? string.Empty : text.Lines[zeroBasedLine].ToString();
 
-    private static string ToCsv(IEnumerable<UsageHit> hits)
-    {
-        var sb = new StringBuilder();
-        sb.AppendLine("ReferencedProject,File,Line,Method,CodeLine");
-        foreach (var h in hits)
-        {
-            sb.AppendLine(string.Join(',', new[]
-            {
-                Csv(h.ReferencedProject), Csv(Rel(h.File)), h.Line.ToString(), Csv(h.Method), Csv(h.CodeLine)
-            }));
-        }
-        return sb.ToString();
-    }
-
-    private static string Csv(string s)
-    {
-        if (s is null) return string.Empty;
-        if (s.Contains('"') || s.Contains(',') || s.Contains('\n'))
-            return '"' + s.Replace("\"", "\"\"") + '"';
-        return s;
-    }
-
-    private static string ToMarkdown(IEnumerable<UsageHit> hits)
-    {
-        var sb = new StringBuilder();
-        sb.AppendLine("| Referenced Project | File | Line | Method | Code Line |");
-        sb.AppendLine("|---|---|---:|---|---|");
-        foreach (var h in hits)
-        {
-            sb.AppendLine($"| {Esc(h.ReferencedProject)} | {Esc(Rel(h.File))} | {h.Line} | {Esc(h.Method)} | {Esc(Trunc(h.CodeLine, 120))} |");
-        }
-        return sb.ToString();
-    }
-
     private static string Rel(string path)
     {
         try { return Path.GetRelativePath(Directory.GetCurrentDirectory(), path); } catch { return path; }
     }
-
-    private static string Trunc(string s, int max)
-        => string.IsNullOrEmpty(s) || s.Length <= max ? s : s.Substring(0, max - 1) + "…";
-
-    private static string Esc(string s) => s.Replace("|", "\\|");
 
     private static string GetEnclosingMember(SemanticModel model, int position)
     {
@@ -492,5 +381,13 @@ internal static class Program
             memberOptions: SymbolDisplayMemberOptions.IncludeParameters | SymbolDisplayMemberOptions.IncludeContainingType,
             parameterOptions: SymbolDisplayParameterOptions.IncludeType | SymbolDisplayParameterOptions.IncludeName);
         return cur.ToDisplayString(fmt);
+    }
+
+    private static IgnoreRule BuildProjectScopedRule(string projToken, string nsPrefix)
+    {
+        var rule = new IgnoreRule { NamespacePrefix = nsPrefix };
+        if (LooksLikePath(projToken)) rule.ProjectPathLiteral = NormalizePathForMatch(projToken);
+        else rule.ProjectNameLiteral = projToken;
+        return rule;
     }
 }
