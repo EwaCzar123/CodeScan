@@ -292,4 +292,45 @@ internal static class Program
         return null!;
     }
 
-    private static string GetDefinitionPath(ISymbol
+    private static string GetDefinitionPath(ISymbol symbol)
+    {
+        var loc = symbol.Locations.FirstOrDefault(l => l.IsInSource);
+        return loc != null ? (loc.SourceTree?.FilePath ?? string.Empty) : string.Empty;
+    }
+
+    private static string GetDisplay(ISymbol s)
+    {
+        var format = new SymbolDisplayFormat(
+            globalNamespaceStyle: SymbolDisplayGlobalNamespaceStyle.Omitted,
+            typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameAndContainingTypesAndNamespaces,
+            genericsOptions: SymbolDisplayGenericsOptions.IncludeTypeParameters,
+            memberOptions: SymbolDisplayMemberOptions.IncludeParameters | SymbolDisplayMemberOptions.IncludeContainingType,
+            parameterOptions: SymbolDisplayParameterOptions.IncludeType | SymbolDisplayParameterOptions.IncludeName,
+            miscellaneousOptions: SymbolDisplayMiscellaneousOptions.ExpandNullable);
+        return s.ToDisplayString(format);
+    }
+
+    private static string SafeGetLine(SourceText text, int zeroBasedLine)
+        => (zeroBasedLine < 0 || zeroBasedLine >= text.Lines.Count) ? string.Empty : text.Lines[zeroBasedLine].ToString();
+
+    private static string Rel(string path)
+    {
+        try { return Path.GetRelativePath(Directory.GetCurrentDirectory(), path); } catch { return path; }
+    }
+
+    private static string GetEnclosingMember(SemanticModel model, int position)
+    {
+        var symbol = model.GetEnclosingSymbol(position);
+        if (symbol == null) return string.Empty;
+        ISymbol cur = symbol;
+        while (cur != null && cur is not IMethodSymbol && cur is not IPropertySymbol && cur is not IEventSymbol && cur is not IFieldSymbol)
+            cur = cur.ContainingSymbol;
+        if (cur == null) cur = symbol.ContainingType ?? symbol;
+
+        var fmt = new SymbolDisplayFormat(
+            typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameAndContainingTypesAndNamespaces,
+            memberOptions: SymbolDisplayMemberOptions.IncludeParameters | SymbolDisplayMemberOptions.IncludeContainingType,
+            parameterOptions: SymbolDisplayParameterOptions.IncludeType | SymbolDisplayParameterOptions.IncludeName);
+        return cur.ToDisplayString(fmt);
+    }
+}
